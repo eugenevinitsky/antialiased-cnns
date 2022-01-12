@@ -67,9 +67,15 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('--data', metavar='DIR', default='/mnt/ssd/tmp/rzhang/ILSVRC2012',
+parser.add_argument('--data', metavar='DIR', default='/datasets01/imagenet_full_size/061417',
                     help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
+parser.add_argument('--dryrun', action='store_true',
+                    help='run on a mini dataset so you don\'t have to build the datafolders over the full imagenet \
+                    dataset')
+parser.add_argument('-l', '--learned-frame', action='store_true',
+                    help='If true, we are going to learn a frame by gradient descent on the loss')
+parser.add_argument('--num_samples', type=int, default=4, help='number of group samples from the frame')
+parser.add_argument('-a', '--arch', metavar='ARCH', default='vgg16',
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
@@ -265,12 +271,59 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             model = torch.nn.DataParallel(model).cuda()
 
-    # define loss function (criterion) and optimizer
+    if args.learned_frame:
+        frame = nn.Sequential(
+            nn.Conv2d(
+                in_channels=3, out_channels=3,
+                kernel_size=7,
+                padding='same', padding_mode='circular',
+                dilation=3,
+            ),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                in_channels=3, out_channels=1,
+                kernel_size=7,
+                padding='same', padding_mode='circular',
+                dilation=3,
+            ),
+            nn.Flatten(),
+            nn.LogSoftmax(dim=-1),
+            nn.Unflatten(dim=-1,unflattened_size=[224, 224])
+        )
+        if args.distributed:
+            # For multiprocessing distributed, DistributedDataParallel constructor
+            # should always set the single device scope, otherwise,
+            # DistributedDataParallel will use all available devices.
+            if args.gpu is not None:
+                frame.cuda(args.gpu)
+                # When using a single GPU per process and per
+                # DistributedDataParallel, we need to divide the batch size
+                # ourselves based on the total number of GPUs we have
+                args.batch_size = int(args.batch_size / ngpus_per_node)
+                args.workers = int(args.workers / ngpus_per_node)
+                frame = torch.nn.parallel.DistributedDataParallel(frame, device_ids=[args.gpu])
+            else:
+                frame.cuda()
+                # DistributedDataParallel will divide and allocate batch_size to all
+                # available GPUs if device_ids are not set
+                frame = torch.nn.parallel.DistributedDataParallel(frame)
+        elif args.gpu is not None:
+            torch.cuda.set_device(args.gpu)
+            frame = frame.cuda(args.gpu)
+        else:
+            frame = torch.nn.DataParallel(frame).cuda()
+        # TODO(eugenevinitsky) add an option for fine-tuning the model as well
+        optimizer = torch.optim.SGD(frame.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay)
+        model.requires_grad = False
+    else:
+        frame = None
+        optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay)
+     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -297,6 +350,10 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data loading code
     traindir = os.path.join(args.data, 'train')
     valdir = os.path.join(args.data, 'val')
+    if args.dryrun:
+        tempdir = '/checkpoint/eugenevinitsky/imagenet_subsample'
+        traindir = os.path.join(tempdir, 'train')
+        valdir = os.path.join(tempdir, 'val')
     mean=[0.485, 0.456, 0.406]
     std=[0.229, 0.224, 0.225]
     normalize = transforms.Normalize(mean=mean, std=std)
@@ -399,7 +456,7 @@ def main_worker(gpu, ngpus_per_node, args):
                       commit=False)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args, frame)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
@@ -419,13 +476,15 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best, epoch, out_dir=args.out_dir)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args, frame=None):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
+    output_device = next(model.parameters()).device
+    torch.autograd.set_detect_anomaly(True)
     # switch to train mode
     model.train()
 
@@ -440,8 +499,26 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             input = input.cuda(args.gpu, non_blocking=True)
         target = target.cuda(args.gpu, non_blocking=True)
 
+        # TODO(eugenevinitsky) I think 
         # compute output
-        output = model(input)
+        if frame is None:
+            output = model(input)
+        else:
+            input = input.to(output_device)
+            frame_x = frame(input)
+            cat = torch.distributions.categorical.Categorical(logits=frame_x.view(input.shape[0], -1))
+            # now draw a few samples from the frame map and 
+            frame_phis = torch.zeros(args.num_samples, input.shape[0], 1000, dtype=input.dtype).cuda(args.gpu, non_blocking=True)
+            shift_imgs = torch.zeros_like(input, dtype=input.dtype).cuda(args.gpu, non_blocking=True)
+            # TODO(eugenevinitsky) remove the double four loop
+            for i in range(args.num_samples):
+                sample = cat.sample()
+                for j in range(input.shape[0]):
+                    p = sample[j] % 224
+                    q = sample[j] // 224
+                    shift_imgs[j] = inv_shift(input[j], (p,q))
+                frame_phis[i] = model(shift_imgs) * cat.log_prob(sample).unsqueeze(1)
+            output = frame_phis.mean(dim=0)
         loss = criterion(output, target)
 
         # measure accuracy and record loss
@@ -717,6 +794,26 @@ def agreement(output0, output1):
     agree = pred0.eq(pred1)
     agree = 100.*torch.mean(agree.type(torch.FloatTensor).to(output0.device))
     return agree
+
+def shift(x, pq):
+    if isinstance(pq, tuple) or isinstance(pq, list):
+        p,q = pq
+    else:
+        p = q = pq
+    assert p > 0 and q > 0
+    y = torch.zeros(3, 224, 224, dtype=x.dtype)
+    y[:, p:,q:] = x[:, :-p,:-q]
+    y[:, :p,:q] = x[:, -p:,-q:]
+    y[:, p:,:q] = x[:, :-p,-q:]
+    y[:, :p,q:] = x[:, -p:,:-q]
+    return y
+
+def inv_shift(x, pq):
+    if isinstance(pq, tuple) or isinstance(pq, list):
+        p,q = pq
+    else:
+        p = q = pq
+    return shift(x, (224-p, 224-q))
 
 
 if __name__ == '__main__':
