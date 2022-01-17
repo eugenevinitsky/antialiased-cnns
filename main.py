@@ -74,8 +74,10 @@ parser.add_argument('--dryrun', action='store_true',
                     dataset')
 parser.add_argument('-l', '--learned-frame', action='store_true',
                     help='If true, we are going to learn a frame by gradient descent on the loss')
+parser.add_argument('--entropy-scale', default=0.0, type=float,
+                    metavar='ES', help='scale of entropy penalty on the learnt frame')
 parser.add_argument('--num_samples', type=int, default=4, help='number of group samples from the frame')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='vgg16',
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
@@ -484,7 +486,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args, frame=None):
     top5 = AverageMeter()
 
     output_device = next(model.parameters()).device
-    torch.autograd.set_detect_anomaly(True)
     # switch to train mode
     model.train()
 
@@ -511,15 +512,17 @@ def train(train_loader, model, criterion, optimizer, epoch, args, frame=None):
             frame_phis = torch.zeros(args.num_samples, input.shape[0], 1000, dtype=input.dtype).cuda(args.gpu, non_blocking=True)
             shift_imgs = torch.zeros_like(input, dtype=input.dtype).cuda(args.gpu, non_blocking=True)
             # TODO(eugenevinitsky) remove the double four loop
-            for i in range(args.num_samples):
+            for j in range(args.num_samples):
                 sample = cat.sample()
-                for j in range(input.shape[0]):
-                    p = sample[j] % 224
-                    q = sample[j] // 224
-                    shift_imgs[j] = inv_shift(input[j], (p,q))
-                frame_phis[i] = model(shift_imgs) * cat.log_prob(sample).unsqueeze(1)
+                for k in range(input.shape[0]):
+                    p = sample[k] % 224
+                    q = sample[k] // 224
+                    shift_imgs[k] = inv_shift(input[k], (p,q))
+                frame_phis[j] = model(shift_imgs).detach() * torch.exp(cat.log_prob(sample) - cat.log_prob(sample).detach()).unsqueeze(1)
             output = frame_phis.mean(dim=0)
         loss = criterion(output, target)
+        if frame is not None and args.entropy_scale > 0.0:
+            loss = loss -args.entropy_scale * torch.sum(frame_x.exp()*frame_x+1e-6)
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -814,6 +817,12 @@ def inv_shift(x, pq):
     else:
         p = q = pq
     return shift(x, (224-p, 224-q))
+
+def save_image(x):
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.imshow(x.cpu().numpy())
+    plt.savefig('test.png')
 
 
 if __name__ == '__main__':
